@@ -27,7 +27,11 @@ export function initSchema(): void {
       exam_datetime TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'CREATED',
       created_by INTEGER NOT NULL REFERENCES users(id),
-      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+      created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+      ciphertext TEXT,
+      iv TEXT,
+      auth_tag TEXT,
+      is_encrypted INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS custody_events (
@@ -43,6 +47,26 @@ export function initSchema(): void {
       created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
     );
   `);
+
+  // Migration safety net for exam_papers.sqlite files created before the
+  // encrypted-storage columns existed (CREATE TABLE IF NOT EXISTS above is a
+  // no-op against an already-existing table).
+  const existingColumns = new Set(
+    (db.prepare("PRAGMA table_info(exam_papers)").all() as { name: string }[]).map(
+      (col) => col.name
+    )
+  );
+  const missingColumns: [string, string][] = [
+    ["ciphertext", "TEXT"],
+    ["iv", "TEXT"],
+    ["auth_tag", "TEXT"],
+    ["is_encrypted", "INTEGER NOT NULL DEFAULT 0"],
+  ];
+  for (const [column, definition] of missingColumns) {
+    if (!existingColumns.has(column)) {
+      db.exec(`ALTER TABLE exam_papers ADD COLUMN ${column} ${definition}`);
+    }
+  }
 }
 
 // Run eagerly, as part of this module's own evaluation: any module that

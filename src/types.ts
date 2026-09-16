@@ -35,6 +35,10 @@ export interface ExamPaper {
   status: string;
   created_by: number;
   created_at: string;
+  ciphertext: string | null;
+  iv: string | null;
+  auth_tag: string | null;
+  is_encrypted: number;
 }
 
 export type EventType =
