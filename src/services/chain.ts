@@ -138,6 +138,33 @@ export function getChain(paperId: number): CustodyEvent[] {
   return allEventsStmt.all(paperId) as CustodyEvent[];
 }
 
+const CENTER_CODE_LENGTH = 6;
+
+export function generateCenterCode(): string {
+  return crypto
+    .randomInt(0, 10 ** CENTER_CODE_LENGTH)
+    .toString()
+    .padStart(CENTER_CODE_LENGTH, "0");
+}
+
+const setCenterCodeStmt = db.prepare(
+  "UPDATE exam_papers SET center_code = ?, center_code_used = 0 WHERE id = ?"
+);
+
+// Adds the RECEIVED_AT_CENTER custody event and, in the same step, generates
+// a fresh confirmation code for the paper (resetting center_code_used), since
+// a new hand-off supersedes any earlier one.
+export function addReceivedAtCenterEvent(
+  paperId: number,
+  actor: Actor,
+  metadata: unknown = {}
+): { event: CustodyEvent; centerCode: string } {
+  const event = addEvent(paperId, "RECEIVED_AT_CENTER", actor, metadata);
+  const centerCode = generateCenterCode();
+  setCenterCodeStmt.run(centerCode, paperId);
+  return { event, centerCode };
+}
+
 export function verifyChain(paperId: number): ChainVerifyResult {
   const events = allEventsStmt.all(paperId) as CustodyEvent[];
 

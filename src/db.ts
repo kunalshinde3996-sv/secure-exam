@@ -31,7 +31,9 @@ export function initSchema(): void {
       ciphertext TEXT,
       iv TEXT,
       auth_tag TEXT,
-      is_encrypted INTEGER NOT NULL DEFAULT 0
+      is_encrypted INTEGER NOT NULL DEFAULT 0,
+      center_code TEXT,
+      center_code_used INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS custody_events (
@@ -61,6 +63,8 @@ export function initSchema(): void {
     ["iv", "TEXT"],
     ["auth_tag", "TEXT"],
     ["is_encrypted", "INTEGER NOT NULL DEFAULT 0"],
+    ["center_code", "TEXT"],
+    ["center_code_used", "INTEGER NOT NULL DEFAULT 0"],
   ];
   for (const [column, definition] of missingColumns) {
     if (!existingColumns.has(column)) {
@@ -75,3 +79,15 @@ export function initSchema(): void {
 // see this module fully evaluated first, so the tables always exist by
 // the time such top-level prepare() calls run.
 initSchema();
+
+// Drops every table and recreates them empty. Children are dropped before
+// their parents so this is safe with foreign_keys=ON. Used only by the demo
+// seed script (src/seed.ts) to guarantee a fresh, reproducible database.
+export function resetDatabase(): void {
+  db.exec(`
+    DROP TABLE IF EXISTS custody_events;
+    DROP TABLE IF EXISTS exam_papers;
+    DROP TABLE IF EXISTS users;
+  `);
+  initSchema();
+}

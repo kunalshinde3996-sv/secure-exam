@@ -1,7 +1,12 @@
 import { Router, Request, Response } from "express";
 import { db } from "../db";
 import { authMiddleware, requireRole } from "../middleware/auth";
-import { addEvent, getChain, verifyChain } from "../services/chain";
+import {
+  addEvent,
+  addReceivedAtCenterEvent,
+  getChain,
+  verifyChain,
+} from "../services/chain";
 import { decryptPaper, encryptPaper } from "../services/crypto";
 import { EVENT_TYPES, EventType, ExamPaper, Role } from "../types";
 
@@ -143,6 +148,19 @@ router.get(
       });
     }
 
+    if (req.user!.role !== "EXAM_BOARD") {
+      const centerConfirmed = db
+        .prepare(
+          "SELECT id FROM custody_events WHERE paper_id = ? AND event_type = 'CENTER_CONFIRMED' LIMIT 1"
+        )
+        .get(paperId);
+      if (!centerConfirmed) {
+        return res.status(403).json({
+          error: "center receipt has not been confirmed for this paper yet",
+        });
+      }
+    }
+
     if (!paper.is_encrypted || !paper.ciphertext || !paper.iv || !paper.auth_tag) {
       return res
         .status(409)
@@ -228,15 +246,80 @@ router.post("/:id/events", (req: Request, res: Response) => {
     });
   }
 
-  const event = addEvent(
-    paperId,
-    event_type as EventType,
-    { id: req.user!.userId, role },
-    metadata ?? {}
-  );
+  const actor = { id: req.user!.userId, role };
+
+  if (event_type === "RECEIVED_AT_CENTER") {
+    const { event, centerCode } = addReceivedAtCenterEvent(
+      paperId,
+      actor,
+      metadata ?? {}
+    );
+    return res.status(201).json({ event, centerCode });
+  }
+
+  const event = addEvent(paperId, event_type as EventType, actor, metadata ?? {});
 
   return res.status(201).json({ event });
 });
+
+router.post(
+  "/:id/confirm-receipt",
+  requireRole("INVIGILATOR", "EXAM_BOARD"),
+  (req: Request, res: Response) => {
+    const paperId = parsePaperId(req.params.id);
+    if (paperId === null) {
+      return res.status(400).json({ error: "invalid paper id" });
+    }
+
+    const paper = db
+      .prepare(
+        "SELECT id, center_code, center_code_used FROM exam_papers WHERE id = ?"
+      )
+      .get(paperId) as
+      | { id: number; center_code: string | null; center_code_used: number }
+      | undefined;
+    if (!paper) {
+      return res.status(404).json({ error: "exam paper not found" });
+    }
+
+    const { code } = req.body ?? {};
+    if (typeof code !== "string" || code.trim().length === 0) {
+      return res.status(400).json({ error: "code is required" });
+    }
+    const submittedCode = code.trim();
+
+    if (!paper.center_code) {
+      return res.status(409).json({
+        error: "no confirmation code has been generated for this paper yet",
+      });
+    }
+    if (paper.center_code_used) {
+      return res
+        .status(409)
+        .json({ error: "this paper's receipt has already been confirmed" });
+    }
+
+    const actor = { id: req.user!.userId, role: req.user!.role };
+
+    if (submittedCode !== paper.center_code) {
+      addEvent(
+        paperId,
+        "TAMPER_SUSPECTED",
+        actor,
+        { reason: "invalid center confirmation code", attemptedCode: submittedCode },
+        true
+      );
+      return res.status(403).json({ error: "invalid code" });
+    }
+
+    db.prepare("UPDATE exam_papers SET center_code_used = 1 WHERE id = ?").run(
+      paperId
+    );
+    addEvent(paperId, "CENTER_CONFIRMED", actor, {});
+
+    return res.status(200).json({ success: true });
+  }
+);
 
 router.get("/:id/chain", (req: Request, res: Response) => {
   const paperId = parsePaperId(req.params.id);

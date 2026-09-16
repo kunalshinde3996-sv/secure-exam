@@ -39,6 +39,8 @@ export interface ExamPaper {
   iv: string | null;
   auth_tag: string | null;
   is_encrypted: number;
+  center_code: string | null;
+  center_code_used: number;
 }
 
 export type EventType =
@@ -46,6 +48,7 @@ export type EventType =
   | "SEALED"
   | "DISPATCHED"
   | "RECEIVED_AT_CENTER"
+  | "CENTER_CONFIRMED"
   | "OPENED"
   | "EARLY_ACCESS_ATTEMPT"
   | "TAMPER_SUSPECTED";
@@ -55,6 +58,7 @@ export const EVENT_TYPES: EventType[] = [
   "SEALED",
   "DISPATCHED",
   "RECEIVED_AT_CENTER",
+  "CENTER_CONFIRMED",
   "OPENED",
   "EARLY_ACCESS_ATTEMPT",
   "TAMPER_SUSPECTED",
