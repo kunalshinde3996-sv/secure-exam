@@ -27,7 +27,7 @@ router.use(authMiddleware);
 
 router.get(
   "/",
-  requireRole("EXAM_BOARD", "DISTRIBUTION_CENTER"),
+  requireRole("EXAM_BOARD", "DISTRIBUTION_CENTER", "PRESS", "INVIGILATOR"),
   (_req: Request, res: Response) => {
     const papers = db
       .prepare(

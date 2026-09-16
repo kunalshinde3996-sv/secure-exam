@@ -1,5 +1,6 @@
 import "dotenv/config";
 
+import cors from "cors";
 import express, { Request, Response } from "express";
 import { initSchema } from "./db";
 import { authMiddleware, requireRole } from "./middleware/auth";
@@ -11,6 +12,7 @@ import papersRoutes from "./routes/papers";
 initSchema();
 
 const app = express();
+app.use(cors({ origin: "http://localhost:5173", credentials: true }));
 app.use(express.json());
 
 app.use(healthRoutes);
