@@ -53,11 +53,11 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: "internal server error" });
 });
 
-const PORT = Number(process.env.PORT) || 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3000;
 
 async function main(): Promise<void> {
   await initSchema();
-  app.listen(PORT, () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`SecureExam backend listening on port ${PORT}`);
   });
 }
