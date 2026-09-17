@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { db } from "../db";
+import { pool } from "../db";
 import { authMiddleware, requireRole } from "../middleware/auth";
 import {
   addEvent,
@@ -9,6 +9,7 @@ import {
 } from "../services/chain";
 import { decryptPaper, encryptPaper } from "../services/crypto";
 import { EVENT_TYPES, EventType, ExamPaper, Role } from "../types";
+import { asyncHandler } from "../utils/asyncHandler";
 
 const router = Router();
 
@@ -33,65 +34,70 @@ router.use(authMiddleware);
 router.get(
   "/",
   requireRole("EXAM_BOARD", "DISTRIBUTION_CENTER", "PRESS", "INVIGILATOR"),
-  (_req: Request, res: Response) => {
-    const papers = db
-      .prepare(
-        "SELECT id, title, exam_datetime, status, created_by, created_at FROM exam_papers ORDER BY id ASC"
-      )
-      .all();
+  asyncHandler(async (_req: Request, res: Response) => {
+    const result = await pool.query(
+      "SELECT id, title, exam_datetime, status, created_by, created_at FROM exam_papers ORDER BY id ASC"
+    );
 
-    return res.status(200).json({ papers });
-  }
+    return res.status(200).json({ papers: result.rows });
+  })
 );
 
-router.post("/", requireRole("EXAM_BOARD"), (req: Request, res: Response) => {
-  const { title, exam_datetime } = req.body ?? {};
+router.post(
+  "/",
+  requireRole("EXAM_BOARD"),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { title, exam_datetime } = req.body ?? {};
 
-  if (typeof title !== "string" || title.trim().length < 1) {
-    return res.status(400).json({ error: "title is required" });
-  }
-  if (
-    typeof exam_datetime !== "string" ||
-    Number.isNaN(Date.parse(exam_datetime))
-  ) {
-    return res
-      .status(400)
-      .json({ error: "exam_datetime must be a valid ISO date string" });
-  }
+    if (typeof title !== "string" || title.trim().length < 1) {
+      return res.status(400).json({ error: "title is required" });
+    }
+    if (
+      typeof exam_datetime !== "string" ||
+      Number.isNaN(Date.parse(exam_datetime))
+    ) {
+      return res
+        .status(400)
+        .json({ error: "exam_datetime must be a valid ISO date string" });
+    }
 
-  const insert = db.prepare(
-    "INSERT INTO exam_papers (title, exam_datetime, created_by) VALUES (?, ?, ?)"
-  );
-  const result = insert.run(title.trim(), exam_datetime, req.user!.userId);
-  const paperId = Number(result.lastInsertRowid);
+    const insertResult = await pool.query(
+      "INSERT INTO exam_papers (title, exam_datetime, created_by) VALUES ($1, $2, $3) RETURNING id",
+      [title.trim(), exam_datetime, req.user!.userId]
+    );
+    const paperId = Number(insertResult.rows[0].id);
 
-  addEvent(
-    paperId,
-    "PRINTED",
-    { id: req.user!.userId, role: req.user!.role },
-    {}
-  );
+    await addEvent(
+      paperId,
+      "PRINTED",
+      { id: req.user!.userId, role: req.user!.role },
+      {}
+    );
 
-  const paper = db
-    .prepare("SELECT * FROM exam_papers WHERE id = ?")
-    .get(paperId) as ExamPaper;
+    const paperResult = await pool.query(
+      "SELECT * FROM exam_papers WHERE id = $1",
+      [paperId]
+    );
+    const paper = paperResult.rows[0] as ExamPaper;
 
-  return res.status(201).json({ paper });
-});
+    return res.status(201).json({ paper });
+  })
+);
 
 router.post(
   "/:id/content",
   requireRole("EXAM_BOARD"),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const paperId = parsePaperId(req.params.id);
     if (paperId === null) {
       return res.status(400).json({ error: "invalid paper id" });
     }
 
-    const paper = db
-      .prepare("SELECT id FROM exam_papers WHERE id = ?")
-      .get(paperId);
-    if (!paper) {
+    const paperResult = await pool.query(
+      "SELECT id FROM exam_papers WHERE id = $1",
+      [paperId]
+    );
+    if (paperResult.rowCount === 0) {
       return res.status(404).json({ error: "exam paper not found" });
     }
 
@@ -104,26 +110,29 @@ router.post(
 
     const { ciphertext, iv, authTag } = encryptPaper(content);
 
-    db.prepare(
-      "UPDATE exam_papers SET ciphertext = ?, iv = ?, auth_tag = ?, is_encrypted = 1 WHERE id = ?"
-    ).run(ciphertext, iv, authTag, paperId);
+    await pool.query(
+      "UPDATE exam_papers SET ciphertext = $1, iv = $2, auth_tag = $3, is_encrypted = 1 WHERE id = $4",
+      [ciphertext, iv, authTag, paperId]
+    );
 
     return res.status(200).json({ message: "content encrypted and stored" });
-  }
+  })
 );
 
 router.get(
   "/:id/download",
   requireRole("INVIGILATOR", "EXAM_BOARD"),
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     const paperId = parsePaperId(req.params.id);
     if (paperId === null) {
       return res.status(400).json({ error: "invalid paper id" });
     }
 
-    const paper = db
-      .prepare("SELECT * FROM exam_papers WHERE id = ?")
-      .get(paperId) as ExamPaper | undefined;
+    const paperResult = await pool.query(
+      "SELECT * FROM exam_papers WHERE id = $1",
+      [paperId]
+    );
+    const paper = paperResult.rows[0] as ExamPaper | undefined;
     if (!paper) {
       return res.status(404).json({ error: "exam paper not found" });
     }
@@ -133,7 +142,7 @@ router.get(
     const unlockAt = new Date(paper.exam_datetime);
 
     if (now.getTime() < unlockAt.getTime()) {
-      addEvent(
+      await addEvent(
         paperId,
         "EARLY_ACCESS_ATTEMPT",
         { id: req.user!.userId, role: req.user!.role },
@@ -149,12 +158,11 @@ router.get(
     }
 
     if (req.user!.role !== "EXAM_BOARD") {
-      const centerConfirmed = db
-        .prepare(
-          "SELECT id FROM custody_events WHERE paper_id = ? AND event_type = 'CENTER_CONFIRMED' LIMIT 1"
-        )
-        .get(paperId);
-      if (!centerConfirmed) {
+      const centerConfirmedResult = await pool.query(
+        "SELECT id FROM custody_events WHERE paper_id = $1 AND event_type = 'CENTER_CONFIRMED' LIMIT 1",
+        [paperId]
+      );
+      if (centerConfirmedResult.rowCount === 0) {
         return res.status(403).json({
           error: "center receipt has not been confirmed for this paper yet",
         });
@@ -167,14 +175,13 @@ router.get(
         .json({ error: "no content has been uploaded for this paper" });
     }
 
-    const alreadyOpenedByActor = db
-      .prepare(
-        "SELECT id FROM custody_events WHERE paper_id = ? AND event_type = 'OPENED' AND actor_id = ? LIMIT 1"
-      )
-      .get(paperId, req.user!.userId);
+    const alreadyOpenedResult = await pool.query(
+      "SELECT id FROM custody_events WHERE paper_id = $1 AND event_type = 'OPENED' AND actor_id = $2 LIMIT 1",
+      [paperId, req.user!.userId]
+    );
 
-    if (!alreadyOpenedByActor) {
-      addEvent(
+    if (alreadyOpenedResult.rowCount === 0) {
+      await addEvent(
         paperId,
         "OPENED",
         { id: req.user!.userId, role: req.user!.role },
@@ -185,97 +192,107 @@ router.get(
     const content = decryptPaper(paper.ciphertext, paper.iv, paper.auth_tag);
 
     return res.status(200).json({ content });
-  }
+  })
 );
 
-router.get("/:id/status", (req: Request, res: Response) => {
-  const paperId = parsePaperId(req.params.id);
-  if (paperId === null) {
-    return res.status(400).json({ error: "invalid paper id" });
-  }
-
-  const paper = db
-    .prepare("SELECT exam_datetime FROM exam_papers WHERE id = ?")
-    .get(paperId) as { exam_datetime: string } | undefined;
-  if (!paper) {
-    return res.status(404).json({ error: "exam paper not found" });
-  }
-
-  const now = Date.now();
-  const unlockAt = new Date(paper.exam_datetime).getTime();
-  const locked = now < unlockAt;
-  const secondsUntilUnlock = Math.max(0, Math.ceil((unlockAt - now) / 1000));
-
-  return res
-    .status(200)
-    .json({ locked, exam_datetime: paper.exam_datetime, secondsUntilUnlock });
-});
-
-router.post("/:id/events", (req: Request, res: Response) => {
-  const paperId = parsePaperId(req.params.id);
-  if (paperId === null) {
-    return res.status(400).json({ error: "invalid paper id" });
-  }
-
-  const paper = db
-    .prepare("SELECT * FROM exam_papers WHERE id = ?")
-    .get(paperId) as ExamPaper | undefined;
-  if (!paper) {
-    return res.status(404).json({ error: "exam paper not found" });
-  }
-
-  const { event_type, metadata } = req.body ?? {};
-
-  if (
-    typeof event_type !== "string" ||
-    !EVENT_TYPES.includes(event_type as EventType)
-  ) {
-    return res
-      .status(400)
-      .json({ error: `event_type must be one of: ${EVENT_TYPES.join(", ")}` });
-  }
-  if (metadata !== undefined && !isPlainObject(metadata)) {
-    return res.status(400).json({ error: "metadata must be a JSON object" });
-  }
-
-  const role = req.user!.role;
-  const allowed = ROLE_EVENT_PERMISSIONS[role] ?? [];
-  if (!allowed.includes(event_type as EventType)) {
-    return res.status(403).json({
-      error: `role ${role} is not permitted to add event type ${event_type}`,
-    });
-  }
-
-  const actor = { id: req.user!.userId, role };
-
-  if (event_type === "RECEIVED_AT_CENTER") {
-    const { event, centerCode } = addReceivedAtCenterEvent(
-      paperId,
-      actor,
-      metadata ?? {}
-    );
-    return res.status(201).json({ event, centerCode });
-  }
-
-  const event = addEvent(paperId, event_type as EventType, actor, metadata ?? {});
-
-  return res.status(201).json({ event });
-});
-
-router.post(
-  "/:id/confirm-receipt",
-  requireRole("INVIGILATOR", "EXAM_BOARD"),
-  (req: Request, res: Response) => {
+router.get(
+  "/:id/status",
+  asyncHandler(async (req: Request, res: Response) => {
     const paperId = parsePaperId(req.params.id);
     if (paperId === null) {
       return res.status(400).json({ error: "invalid paper id" });
     }
 
-    const paper = db
-      .prepare(
-        "SELECT id, center_code, center_code_used FROM exam_papers WHERE id = ?"
-      )
-      .get(paperId) as
+    const paperResult = await pool.query(
+      "SELECT exam_datetime FROM exam_papers WHERE id = $1",
+      [paperId]
+    );
+    const paper = paperResult.rows[0] as { exam_datetime: string } | undefined;
+    if (!paper) {
+      return res.status(404).json({ error: "exam paper not found" });
+    }
+
+    const now = Date.now();
+    const unlockAt = new Date(paper.exam_datetime).getTime();
+    const locked = now < unlockAt;
+    const secondsUntilUnlock = Math.max(0, Math.ceil((unlockAt - now) / 1000));
+
+    return res
+      .status(200)
+      .json({ locked, exam_datetime: paper.exam_datetime, secondsUntilUnlock });
+  })
+);
+
+router.post(
+  "/:id/events",
+  asyncHandler(async (req: Request, res: Response) => {
+    const paperId = parsePaperId(req.params.id);
+    if (paperId === null) {
+      return res.status(400).json({ error: "invalid paper id" });
+    }
+
+    const paperResult = await pool.query(
+      "SELECT * FROM exam_papers WHERE id = $1",
+      [paperId]
+    );
+    const paper = paperResult.rows[0] as ExamPaper | undefined;
+    if (!paper) {
+      return res.status(404).json({ error: "exam paper not found" });
+    }
+
+    const { event_type, metadata } = req.body ?? {};
+
+    if (
+      typeof event_type !== "string" ||
+      !EVENT_TYPES.includes(event_type as EventType)
+    ) {
+      return res
+        .status(400)
+        .json({ error: `event_type must be one of: ${EVENT_TYPES.join(", ")}` });
+    }
+    if (metadata !== undefined && !isPlainObject(metadata)) {
+      return res.status(400).json({ error: "metadata must be a JSON object" });
+    }
+
+    const role = req.user!.role;
+    const allowed = ROLE_EVENT_PERMISSIONS[role] ?? [];
+    if (!allowed.includes(event_type as EventType)) {
+      return res.status(403).json({
+        error: `role ${role} is not permitted to add event type ${event_type}`,
+      });
+    }
+
+    const actor = { id: req.user!.userId, role };
+
+    if (event_type === "RECEIVED_AT_CENTER") {
+      const { event, centerCode } = await addReceivedAtCenterEvent(
+        paperId,
+        actor,
+        metadata ?? {}
+      );
+      return res.status(201).json({ event, centerCode });
+    }
+
+    const event = await addEvent(paperId, event_type as EventType, actor, metadata ?? {});
+
+    return res.status(201).json({ event });
+  })
+);
+
+router.post(
+  "/:id/confirm-receipt",
+  requireRole("INVIGILATOR", "EXAM_BOARD"),
+  asyncHandler(async (req: Request, res: Response) => {
+    const paperId = parsePaperId(req.params.id);
+    if (paperId === null) {
+      return res.status(400).json({ error: "invalid paper id" });
+    }
+
+    const paperResult = await pool.query(
+      "SELECT id, center_code, center_code_used FROM exam_papers WHERE id = $1",
+      [paperId]
+    );
+    const paper = paperResult.rows[0] as
       | { id: number; center_code: string | null; center_code_used: number }
       | undefined;
     if (!paper) {
@@ -302,7 +319,7 @@ router.post(
     const actor = { id: req.user!.userId, role: req.user!.role };
 
     if (submittedCode !== paper.center_code) {
-      addEvent(
+      await addEvent(
         paperId,
         "TAMPER_SUSPECTED",
         actor,
@@ -312,49 +329,58 @@ router.post(
       return res.status(403).json({ error: "invalid code" });
     }
 
-    db.prepare("UPDATE exam_papers SET center_code_used = 1 WHERE id = ?").run(
-      paperId
+    await pool.query(
+      "UPDATE exam_papers SET center_code_used = 1 WHERE id = $1",
+      [paperId]
     );
-    addEvent(paperId, "CENTER_CONFIRMED", actor, {});
+    await addEvent(paperId, "CENTER_CONFIRMED", actor, {});
 
     return res.status(200).json({ success: true });
-  }
+  })
 );
 
-router.get("/:id/chain", (req: Request, res: Response) => {
-  const paperId = parsePaperId(req.params.id);
-  if (paperId === null) {
-    return res.status(400).json({ error: "invalid paper id" });
-  }
+router.get(
+  "/:id/chain",
+  asyncHandler(async (req: Request, res: Response) => {
+    const paperId = parsePaperId(req.params.id);
+    if (paperId === null) {
+      return res.status(400).json({ error: "invalid paper id" });
+    }
 
-  const paper = db
-    .prepare("SELECT id FROM exam_papers WHERE id = ?")
-    .get(paperId);
-  if (!paper) {
-    return res.status(404).json({ error: "exam paper not found" });
-  }
+    const paperResult = await pool.query(
+      "SELECT id FROM exam_papers WHERE id = $1",
+      [paperId]
+    );
+    if (paperResult.rowCount === 0) {
+      return res.status(404).json({ error: "exam paper not found" });
+    }
 
-  const events = getChain(paperId);
+    const events = await getChain(paperId);
 
-  return res.status(200).json({ paperId, events });
-});
+    return res.status(200).json({ paperId, events });
+  })
+);
 
-router.get("/:id/verify", (req: Request, res: Response) => {
-  const paperId = parsePaperId(req.params.id);
-  if (paperId === null) {
-    return res.status(400).json({ error: "invalid paper id" });
-  }
+router.get(
+  "/:id/verify",
+  asyncHandler(async (req: Request, res: Response) => {
+    const paperId = parsePaperId(req.params.id);
+    if (paperId === null) {
+      return res.status(400).json({ error: "invalid paper id" });
+    }
 
-  const paper = db
-    .prepare("SELECT id FROM exam_papers WHERE id = ?")
-    .get(paperId);
-  if (!paper) {
-    return res.status(404).json({ error: "exam paper not found" });
-  }
+    const paperResult = await pool.query(
+      "SELECT id FROM exam_papers WHERE id = $1",
+      [paperId]
+    );
+    if (paperResult.rowCount === 0) {
+      return res.status(404).json({ error: "exam paper not found" });
+    }
 
-  const result = verifyChain(paperId);
+    const result = await verifyChain(paperId);
 
-  return res.status(200).json(result);
-});
+    return res.status(200).json(result);
+  })
+);
 
 export default router;

@@ -1,15 +1,13 @@
 import "dotenv/config";
 
 import cors from "cors";
-import express, { Request, Response } from "express";
+import express, { NextFunction, Request, Response } from "express";
 import { initSchema } from "./db";
 import { authMiddleware, requireRole } from "./middleware/auth";
 import authRoutes from "./routes/auth";
 import devRoutes from "./routes/dev";
 import healthRoutes from "./routes/health";
 import papersRoutes from "./routes/papers";
-
-initSchema();
 
 const app = express();
 app.use(
@@ -48,8 +46,23 @@ app.get(
   }
 );
 
+// Must be registered after all routes: Express recognizes an error handler
+// by its four-argument signature.
+app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  console.error(err);
+  res.status(500).json({ error: "internal server error" });
+});
+
 const PORT = Number(process.env.PORT) || 3000;
 
-app.listen(PORT, () => {
-  console.log(`SecureExam backend listening on port ${PORT}`);
+async function main(): Promise<void> {
+  await initSchema();
+  app.listen(PORT, () => {
+    console.log(`SecureExam backend listening on port ${PORT}`);
+  });
+}
+
+main().catch((err) => {
+  console.error("Failed to start SecureExam backend:", err);
+  process.exit(1);
 });

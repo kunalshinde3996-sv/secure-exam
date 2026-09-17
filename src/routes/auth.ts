@@ -1,8 +1,9 @@
 import { Router, Request, Response } from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
-import { db } from "../db";
+import { pool } from "../db";
 import { PublicUser, Role, ROLES, User } from "../types";
+import { asyncHandler } from "../utils/asyncHandler";
 
 const router = Router();
 
@@ -20,7 +21,7 @@ function toPublicUser(user: User): PublicUser {
   };
 }
 
-router.post("/register", (req: Request, res: Response) => {
+router.post("/register", asyncHandler(async (req: Request, res: Response) => {
   const { name, email, password, role } = req.body ?? {};
 
   if (typeof name !== "string" || name.trim().length < 1) {
@@ -42,33 +43,30 @@ router.post("/register", (req: Request, res: Response) => {
 
   const normalizedEmail = email.trim().toLowerCase();
 
-  const existing = db
-    .prepare("SELECT id FROM users WHERE email = ?")
-    .get(normalizedEmail);
+  const existing = await pool.query("SELECT id FROM users WHERE email = $1", [
+    normalizedEmail,
+  ]);
 
-  if (existing) {
+  if (existing.rowCount && existing.rowCount > 0) {
     return res.status(400).json({ error: "a user with this email already exists" });
   }
 
   const passwordHash = bcrypt.hashSync(password, 10);
 
-  const insert = db.prepare(
-    "INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)"
+  const insertResult = await pool.query(
+    "INSERT INTO users (name, email, password_hash, role) VALUES ($1, $2, $3, $4) RETURNING *",
+    [name.trim(), normalizedEmail, passwordHash, role]
   );
-  const result = insert.run(name.trim(), normalizedEmail, passwordHash, role);
-
-  const user = db
-    .prepare("SELECT * FROM users WHERE id = ?")
-    .get(result.lastInsertRowid) as User;
+  const user = insertResult.rows[0] as User;
 
   const token = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, {
     expiresIn: TOKEN_EXPIRY,
   });
 
   return res.status(201).json({ token, user: toPublicUser(user) });
-});
+}));
 
-router.post("/login", (req: Request, res: Response) => {
+router.post("/login", asyncHandler(async (req: Request, res: Response) => {
   const { email, password } = req.body ?? {};
 
   if (typeof email !== "string" || !EMAIL_REGEX.test(email.trim())) {
@@ -80,9 +78,10 @@ router.post("/login", (req: Request, res: Response) => {
 
   const normalizedEmail = email.trim().toLowerCase();
 
-  const user = db
-    .prepare("SELECT * FROM users WHERE email = ?")
-    .get(normalizedEmail) as User | undefined;
+  const result = await pool.query("SELECT * FROM users WHERE email = $1", [
+    normalizedEmail,
+  ]);
+  const user = result.rows[0] as User | undefined;
 
   if (!user) {
     return res.status(401).json({ error: "invalid email or password" });
@@ -98,6 +97,6 @@ router.post("/login", (req: Request, res: Response) => {
   });
 
   return res.status(200).json({ token, user: toPublicUser(user) });
-});
+}));
 
 export default router;

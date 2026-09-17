@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { db } from "../db";
+import { pool } from "../db";
 import { CustodyEvent, EventType, Role } from "../types";
 
 export const GENESIS_HASH = "0".repeat(64);
@@ -64,42 +64,30 @@ export function computeHash(input: HashInput): string {
   return crypto.createHash("sha256").update(raw).digest("hex");
 }
 
-const paperExistsStmt = db.prepare("SELECT id FROM exam_papers WHERE id = ?");
-
-const latestEventStmt = db.prepare(
-  "SELECT * FROM custody_events WHERE paper_id = ? ORDER BY id DESC LIMIT 1"
-);
-
-const allEventsStmt = db.prepare(
-  "SELECT * FROM custody_events WHERE paper_id = ? ORDER BY id ASC"
-);
-
-const getEventByIdStmt = db.prepare("SELECT * FROM custody_events WHERE id = ?");
-
-const insertEventStmt = db.prepare(`
-  INSERT INTO custody_events
-    (paper_id, event_type, actor_id, actor_role, prev_hash, hash, metadata, is_flagged, created_at)
-  VALUES
-    (@paper_id, @event_type, @actor_id, @actor_role, @prev_hash, @hash, @metadata, @is_flagged, @created_at)
-`);
-
-const updatePaperStatusStmt = db.prepare(
-  "UPDATE exam_papers SET status = ? WHERE id = ?"
-);
-
-export function addEvent(
+export async function addEvent(
   paperId: number,
   eventType: EventType,
   actor: Actor,
   metadata: unknown = {},
   isFlagged?: boolean
-): CustodyEvent {
-  if (!paperExistsStmt.get(paperId)) {
-    throw new Error(`exam paper ${paperId} does not exist`);
-  }
+): Promise<CustodyEvent> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
 
-  const runInsert = db.transaction(() => {
-    const latest = latestEventStmt.get(paperId) as CustodyEvent | undefined;
+    const paperExists = await client.query(
+      "SELECT id FROM exam_papers WHERE id = $1",
+      [paperId]
+    );
+    if (paperExists.rowCount === 0) {
+      throw new Error(`exam paper ${paperId} does not exist`);
+    }
+
+    const latestResult = await client.query(
+      "SELECT * FROM custody_events WHERE paper_id = $1 ORDER BY id DESC LIMIT 1",
+      [paperId]
+    );
+    const latest = latestResult.rows[0] as CustodyEvent | undefined;
     const prevHash = latest ? latest.hash : GENESIS_HASH;
     const createdAt = new Date().toISOString();
     const flagged = isFlagged ?? AUTO_FLAG_EVENT_TYPES.has(eventType);
@@ -114,28 +102,45 @@ export function addEvent(
       metadata,
     });
 
-    const result = insertEventStmt.run({
-      paper_id: paperId,
-      event_type: eventType,
-      actor_id: actor.id,
-      actor_role: actor.role,
-      prev_hash: prevHash,
-      hash,
-      metadata: canonicalJsonStringify(metadata),
-      is_flagged: flagged ? 1 : 0,
-      created_at: createdAt,
-    });
+    const insertResult = await client.query(
+      `INSERT INTO custody_events
+        (paper_id, event_type, actor_id, actor_role, prev_hash, hash, metadata, is_flagged, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING *`,
+      [
+        paperId,
+        eventType,
+        actor.id,
+        actor.role,
+        prevHash,
+        hash,
+        canonicalJsonStringify(metadata),
+        flagged ? 1 : 0,
+        createdAt,
+      ]
+    );
 
-    updatePaperStatusStmt.run(eventType, paperId);
+    await client.query("UPDATE exam_papers SET status = $1 WHERE id = $2", [
+      eventType,
+      paperId,
+    ]);
 
-    return getEventByIdStmt.get(result.lastInsertRowid) as CustodyEvent;
-  });
-
-  return runInsert();
+    await client.query("COMMIT");
+    return insertResult.rows[0] as CustodyEvent;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
-export function getChain(paperId: number): CustodyEvent[] {
-  return allEventsStmt.all(paperId) as CustodyEvent[];
+export async function getChain(paperId: number): Promise<CustodyEvent[]> {
+  const result = await pool.query(
+    "SELECT * FROM custody_events WHERE paper_id = $1 ORDER BY id ASC",
+    [paperId]
+  );
+  return result.rows as CustodyEvent[];
 }
 
 const CENTER_CODE_LENGTH = 6;
@@ -147,26 +152,25 @@ export function generateCenterCode(): string {
     .padStart(CENTER_CODE_LENGTH, "0");
 }
 
-const setCenterCodeStmt = db.prepare(
-  "UPDATE exam_papers SET center_code = ?, center_code_used = 0 WHERE id = ?"
-);
-
 // Adds the RECEIVED_AT_CENTER custody event and, in the same step, generates
 // a fresh confirmation code for the paper (resetting center_code_used), since
 // a new hand-off supersedes any earlier one.
-export function addReceivedAtCenterEvent(
+export async function addReceivedAtCenterEvent(
   paperId: number,
   actor: Actor,
   metadata: unknown = {}
-): { event: CustodyEvent; centerCode: string } {
-  const event = addEvent(paperId, "RECEIVED_AT_CENTER", actor, metadata);
+): Promise<{ event: CustodyEvent; centerCode: string }> {
+  const event = await addEvent(paperId, "RECEIVED_AT_CENTER", actor, metadata);
   const centerCode = generateCenterCode();
-  setCenterCodeStmt.run(centerCode, paperId);
+  await pool.query(
+    "UPDATE exam_papers SET center_code = $1, center_code_used = 0 WHERE id = $2",
+    [centerCode, paperId]
+  );
   return { event, centerCode };
 }
 
-export function verifyChain(paperId: number): ChainVerifyResult {
-  const events = allEventsStmt.all(paperId) as CustodyEvent[];
+export async function verifyChain(paperId: number): Promise<ChainVerifyResult> {
+  const events = await getChain(paperId);
 
   let expectedPrevHash = GENESIS_HASH;
 

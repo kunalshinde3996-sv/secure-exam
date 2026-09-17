@@ -1,14 +1,15 @@
 import { Router, Request, Response } from "express";
-import { db } from "../db";
+import { pool } from "../db";
 import { authMiddleware } from "../middleware/auth";
 import { CustodyEvent } from "../types";
+import { asyncHandler } from "../utils/asyncHandler";
 
 const router = Router();
 
 router.post(
   "/tamper/:eventId",
   authMiddleware,
-  (req: Request, res: Response) => {
+  asyncHandler(async (req: Request, res: Response) => {
     if (process.env.NODE_ENV === "production") {
       return res.status(404).json({ error: "not found" });
     }
@@ -24,9 +25,11 @@ router.post(
       return res.status(400).json({ error: "invalid event id" });
     }
 
-    const existing = db
-      .prepare("SELECT * FROM custody_events WHERE id = ?")
-      .get(eventId) as CustodyEvent | undefined;
+    const existingResult = await pool.query(
+      "SELECT * FROM custody_events WHERE id = $1",
+      [eventId]
+    );
+    const existing = existingResult.rows[0] as CustodyEvent | undefined;
     if (!existing) {
       return res.status(404).json({ error: "custody event not found" });
     }
@@ -38,19 +41,20 @@ router.post(
         : { tampered: true, at: new Date().toISOString() }
     );
 
-    db.prepare("UPDATE custody_events SET metadata = ? WHERE id = ?").run(
+    await pool.query("UPDATE custody_events SET metadata = $1 WHERE id = $2", [
       tamperedMetadata,
-      eventId
-    );
+      eventId,
+    ]);
 
-    const updated = db
-      .prepare("SELECT * FROM custody_events WHERE id = ?")
-      .get(eventId);
+    const updatedResult = await pool.query(
+      "SELECT * FROM custody_events WHERE id = $1",
+      [eventId]
+    );
 
     return res
       .status(200)
-      .json({ warning: "metadata tampered without recomputing hash", event: updated });
-  }
+      .json({ warning: "metadata tampered without recomputing hash", event: updatedResult.rows[0] });
+  })
 );
 
 export default router;
